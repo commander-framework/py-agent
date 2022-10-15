@@ -1,7 +1,7 @@
+import asyncio
 import json
 import logging
 from logging.handlers import TimedRotatingFileHandler
-from multiprocessing import Process, Lock
 import os
 from platform import system
 import requests
@@ -33,12 +33,31 @@ class CommanderAgent:
             self.register()
         self.headers = {"Content-Type": "application/json",
                         "agentID": self.agentID}
-        self.beacon = Process(target=self.checkIn)
-        self.runner = Process(target=self.worker)
         self.exitSignal = False
-        self.jobQueue = []
-        self.jobQueueLock = Lock()
-        self.connectedToServer = True
+        self.jobQueue = asyncio.Queue()
+        self.connectedToServer = False
+
+    def logInit(self, logLevel):
+        """ Configure log level (1-5) and OS-dependent log file location """
+        # set log level
+        level = [logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR, logging.CRITICAL][5-logLevel]
+        logging.basicConfig(level=level, format="%(levelname)-8s: %(message)s")
+        log = logging.getLogger("CommanderAgent")
+        formatter = logging.Formatter(fmt="%(asctime)s.%(msecs)03d %(levelname)-8s %(message)s",
+                                      datefmt="%Y-%m-%d %H:%M:%S")
+        if self.os == "Linux" or self.os == "Darwin":
+            handler = TimedRotatingFileHandler(filename="/var/log/commander.log",
+                                                   encoding="utf-8",
+                                                   when="D",  # Daily
+                                                   backupCount=7)
+        elif self.os == "Windows":
+            handler = TimedRotatingFileHandler(filename="commander.log",
+                                                   encoding="utf-8",
+                                                   when="D",  # Daily
+                                                   backupCount=7)
+        handler.setFormatter(formatter)
+        log.addHandler(handler)
+        return log
 
     def request(self, method, directory, body=None, headers=None, files=None):
         """ HTTPS request to Commander server using client and server verification """
@@ -119,64 +138,58 @@ class CommanderAgent:
                 configFile.write(json.dumps(configJson))
         return
 
-    def checkIn(self):
+    async def checkIn(self):
         """ Check in with the commander server to see if there are any jobs to run """
         logError = True
-        while not self.exitSignal:
-            # send request to server
-            response = self.request("GET", "/agent/jobs")
-            if response.status_code != 200:
-                if logError:
-                    self.log.error("HTTP"+str(response.status_code)+": "+response.json["error"])
-                    logError = False
-                sleep(5)
-                continue
-            logError = True
-            # TODO: download executable and create job
-            sleep(5)
+        sslContext = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        sslContext.load_verify_locations(caPath)
+        sslContext.load_cert_chain(certfile=cert[0], keyfile=cert[1])
+        async with websockets.connect(f"wss://{self.commanderServer}/agent/checkin", ssl=sslContext) as ws:
+            await ws.send(json.dumps({"Agent-ID": self.agentID}))
+            while not self.exitSignal:
+                await self.getJobs()
 
-    def execute(self, filePath):
+    async def getJobs(self):
+        """ Receive one or more jobs from the websocket """
+        try:
+            jobs = await asyncio.wait_for(ws.recv(), timeout=1)
+        except asyncio.exceptions.TimeoutError:
+            jobs = None
+        if jobs:
+            await ws.send("ack")
+            # TODO: unpack jobs and add them to thread-safe queue
+
+    async def worker(self):
+        """ Asynchronously check the queue for jobs """
+        while not self.exitSignal:
+            await self.doJob()
+
+    async def doJob(self):
+        """ Get a job from the queue and execute it """
+        try:
+            job = await self.jobQueue.get()
+        except asyncio.exceptions.TimeoutError:
+            job = None
+        if job:
+            # download job's executable
+            jobFile = self.fetchJobPackage(job)
+            self.execute(jobFile)
+
+    def fetchJobPackage(self, job):
+        """ Get the job package from the server and return the filename """
+        # TODO: implement
+        pass
+
+    def execute(self, filename):
         """ Call the executable for a job and return its output and execution status """
+        # TODO: implement
         pass
 
     def cleanup(self, filePath):
         """ Remove executable for a job and send execution status back to commander server """
+        # TODO: implement
         pass
-
-    def worker(self):
-        """ Asynchronously execute jobs from commander server """
-        while not self.exitSignal:
-            if self.jobQueue:
-                with self.jobQueueLock:
-                    job = Process(target=self.execute, args=(self.jobQueue.pop(0)))
-                    job.start()
-            sleep(5)
-
-    def logInit(self, logLevel):
-        """ Configure log level (1-5) and OS-dependent log file location """
-        # set log level
-        level = [logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR, logging.CRITICAL][5-logLevel]
-        logging.basicConfig(level=level, format="%(levelname)-8s: %(message)s")
-        log = logging.getLogger("CommanderAgent")
-        formatter = logging.Formatter(fmt="%(asctime)s.%(msecs)03d %(levelname)-8s %(message)s",
-                                      datefmt="%Y-%m-%d %H:%M:%S")
-        if self.os == "Linux" or self.os == "Darwin":
-            handler = TimedRotatingFileHandler(filename="/var/log/commander.log",
-                                                   encoding="utf-8",
-                                                   when="D",  # Daily
-                                                   backupCount=7)
-        elif self.os == "Windows":
-            handler = TimedRotatingFileHandler(filename="commander.log",
-                                                   encoding="utf-8",
-                                                   when="D",  # Daily
-                                                   backupCount=7)
-        handler.setFormatter(formatter)
-        log.addHandler(handler)
-        return log
 
     def run(self):
         """ Start agent """
-        self.beacon.start()
-        self.runner.start()
-        self.beacon.join()
-        self.runner.join()
+        asyncio.gather(self.checkIn(), self.worker())
