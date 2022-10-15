@@ -31,8 +31,6 @@ class CommanderAgent:
         self.registrationKey = registrationKey
         if self.registrationKey:
             self.register()
-        if not self.commanderServer:
-            raise ValueError("server address was not included in the installer or was not found in existing config")
         self.headers = {"Content-Type": "application/json",
                         "agentID": self.agentID}
         self.beacon = Process(target=self.checkIn)
