@@ -2,21 +2,35 @@ import json
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from multiprocessing import Process, Lock
+import os
 from platform import system
 import requests
 from socket import gethostname
+import sys
 from time import sleep
+
+
+def resourcePath(relativePath):
+    """ Get absolute path to resource, works in and out of PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 
 class CommanderAgent:
     def __init__(self, serverAddress="", registrationKey="", logLevel=3):
         self.os = system()
         self.log = self.logInit(logLevel)
-        self.clientCert = ("agentCert.crt", "agentKey.pem")
-        self.serverCert = "commander.crt"
+        self.clientCert = (resourcePath("agentCert.crt"), resourcePath("agentKey.pem"))
+        self.serverCert = resourcePath("commander.crt")
         self.commanderServer = serverAddress
         self.registrationKey = registrationKey
-        self.agentID = self.register()
+        if self.registrationKey:
+            self.register()
+        self.agentID = f"{gethostname()}.{self.commanderServer}"
         if not self.commanderServer:
             raise ValueError("server address was not included in the installer or was not found in existing config")
         self.headers = {"Content-Type": "application/json",
@@ -95,9 +109,9 @@ class CommanderAgent:
             response = self.request("POST", "/agent/register",
                                     headers={"Content-Type": "application/json"},
                                     body={"registrationKey": self.registrationKey,
-                                            "hostname": gethostname(),
-                                            "os": self.os})
-            # create config and save to disk
+                                          "hostname": gethostname(),
+                                          "os": self.os})
+            # create config and save to disk for troubleshooting
             if "error" in response.json:
                 self.log.error("HTTP"+str(response.status_code)+": "+response.json["error"])
             configJson = {"hostname": gethostname(),
@@ -105,7 +119,7 @@ class CommanderAgent:
                           "commanderServer": self.commanderServer}
             with open("agentConfig.json", "w+") as configFile:
                 configFile.write(json.dumps(configJson))
-        return configJson["agentID"]
+        return
 
     def checkIn(self):
         """ Check in with the commander server to see if there are any jobs to run """
