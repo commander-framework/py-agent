@@ -27,10 +27,10 @@ class CommanderAgent:
         self.clientCert = (resourcePath("agentCert.crt"), resourcePath("agentKey.pem"))
         self.serverCert = resourcePath("commander.crt")
         self.commanderServer = serverAddress
+        self.agentID = f"{gethostname()}.{self.commanderServer}"
         self.registrationKey = registrationKey
         if self.registrationKey:
             self.register()
-        self.agentID = f"{gethostname()}.{self.commanderServer}"
         if not self.commanderServer:
             raise ValueError("server address was not included in the installer or was not found in existing config")
         self.headers = {"Content-Type": "application/json",
