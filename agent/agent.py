@@ -208,11 +208,19 @@ class CommanderAgent:
         # TODO: implement
         pass
 
-    def cleanup(self, filePath):
+    def cleanup(self, filePath, status, output):
         """ Delete the given job package and send execution status back to commander server """
         # TODO: implement
         pass
 
+    async def garbageCollector(self):
+        """ Remove completed jobs from the running jobs list """
+        while not self.exitSignal:
+            for job in self.runningJobs:
+                if not job.is_alive():
+                    self.runningJobs.remove(job)
+            await asyncio.sleep(5)
+
     def run(self):
         """ Start agent """
-        asyncio.gather(self.checkIn(), self.worker())
+        asyncio.gather(self.checkIn(), self.worker(), self.garbageCollector())
