@@ -216,9 +216,9 @@ class CommanderAgent:
     async def garbageCollector(self):
         """ Remove completed jobs from the running jobs list """
         while not self.exitSignal:
-            for job in self.runningJobs:
-                if not job.is_alive():
-                    self.runningJobs.remove(job)
+            for process in self.runningJobs:
+                if not process.is_alive():
+                    self.runningJobs.remove(process)
             await asyncio.sleep(5)
 
     def run(self):
