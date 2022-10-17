@@ -1,4 +1,5 @@
 import asyncio
+from calendar import c
 import json
 import logging
 from logging.handlers import TimedRotatingFileHandler
@@ -6,11 +7,15 @@ from multiprocessing import Process
 import os
 from platform import system
 import requests
+import shutil
 from socket import gethostname
 import ssl
+import subprocess
 import sys
 import tempfile
+from utils import utcNowTimestamp
 import websockets
+import zipfile
 
 
 def resourcePath(relativePath):
@@ -75,43 +80,42 @@ class CommanderAgent:
                                         headers=headers,
                                         cert=self.clientCert,
                                         verify=self.serverCert,
-                                        data=body)
+                                        data=json.dumps(body))
             elif method == "POST":
                 response = requests.post(f"https://{self.commanderServer}{directory}",
                                         headers=headers,
                                         cert=self.clientCert,
                                         verify=self.serverCert,
-                                        data=body,
+                                        data=json.dumps(body),
                                         files=files)
             elif method == "PUT":
                 response = requests.put(f"https://{self.commanderServer}{directory}",
                                         headers=headers,
                                         cert=self.clientCert,
                                         verify=self.serverCert,
-                                        data=body,
+                                        data=json.dumps(body),
                                         files=files)
             elif method == "DELETE":
                 response = requests.delete(f"https://{self.commanderServer}{directory}",
                                         headers=headers,
                                         cert=self.clientCert,
                                         verify=self.serverCert,
-                                        data=body,
+                                        data=json.dumps(body),
                                         files=files)
             else:  # method == "PATCH":
                 response = requests.patch(f"https://{self.commanderServer}{directory}",
                                         headers=headers,
                                         cert=self.clientCert,
                                         verify=self.serverCert,
-                                        data=body,
+                                        data=json.dumps(body),
                                         files=files)
-        except ConnectionError:
-            # only log one failure until it connects again
-            if self.connectedToServer:
-                self.log.warning("Unable to contact server")
-                self.connectedToServer = False
+            self.connectedToServer = True
+        except requests.exceptions.RequestException as e:
+            # log failure
+            self.log.warning(f"Unable to contact server: {e}")
+            self.connectedToServer = False
         except Exception as e:
-            self.log.error(f"Error while sending a request to the server: {e}")
-        self.connectedToServer = True
+            self.log.critical(f"Unhandled error while sending a request to the server: {e}")
         return response
 
     def register(self):
@@ -198,28 +202,66 @@ class CommanderAgent:
                                 headers={"Content-Type": "application/json",
                                          "Agent-ID": self.agentID},
                                 body={"filename": job["filename"]})
-        jobPath = f"{tempfile.gettempdir()}/{job['filename']}.job"
-        with open(jobPath, "wb") as f:
-            f.write(response.content)
-        self.execute(jobPath)
+        with open(f"{tempfile.gettempdir()}/{job['filename']}.job", "wb") as jobPackage:
+            jobPackage.write(response.content)
+        self.execute(job)
 
-    def execute(self, filePath):
+    def execute(self, job):
         """ Execute the given job package and start cleanup """
-        # TODO: implement
-        pass
+        # parse manifest and extract zip archive
+        with zipfile.ZipFile(f"{tempfile.gettempdir()}/{job['filename']}.job", "r") as jobPackage:
+            jobPackage.extractall(path=f"{tempfile.gettempdir()}/{job['jobID']}")
+        # execute job
+        commandline = []
+        if job["executor"] != "binary":
+            commandline.append(job['executor'])
+        commandline.append(f"{tempfile.gettempdir()}/{job['jobID']}/{job['filename']}")
+        commandline = commandline + [arg for arg in job['argv']]
+        job["timeStarted"] = utcNowTimestamp()
+        result = subprocess.Popen(commandline, capture_output=True)
+        # capture output and clean up
+        stdout, stderr = result.communicate()
+        job["timeEnded"] = utcNowTimestamp()
+        job["exitCode"] = result.returncode
+        job["stdout"] = stdout.decode("utf-8")
+        job["stderr"] = stderr.decode("utf-8")
+        self.cleanup(job)
 
-    def cleanup(self, filePath, status, output):
-        """ Delete the given job package and send execution status back to commander server """
-        # TODO: implement
-        pass
+
+    def cleanup(self, job):
+        """ Send execution status back to commander server and delete the job package """
+        response = self.request("POST", "/agent/history",
+                                headers={"Content-Type": "application/json",
+                                         "Agent-ID": self.agentID},
+                                body={"job": job})
+        if response.status_code != 200:
+            self.log.error(f"Error when reporting job execution status: {response.status_code} -- {response.json['error']}")
+            # save job to disk for later reporting
+            if not os.path.exists("ReportsQueue"):
+                os.mkdir("ReportsQueue")
+            with open(f"ReportsQueue/{job['jobID']}.json", "w") as f:
+                f.write(json.dumps(job))
+            return
+        self.log.info(f"Job {job['jobID']} completed successfully")
+        # delete job package
+        shutil.rmtree(f"{tempfile.gettempdir()}/{job['jobID']}")
+        os.remove(f"{tempfile.gettempdir()}/{job['filename']}.job")
 
     async def garbageCollector(self):
-        """ Remove completed jobs from the running jobs list """
+        """ Clean up finished jobs and remediate failed tasks """
         while not self.exitSignal:
+            # remove completed jobs from the running jobs list
             for process in self.runningJobs:
                 if not process.is_alive():
                     self.runningJobs.remove(process)
-            await asyncio.sleep(5)
+            # retry sending reports for jobs that failed to report
+            if os.path.exists("ReportsQueue"):
+                reports = [item for item in os.listdir("ReportsQueue") if os.path.isfile(item)]
+                for report in reports:
+                    with open(f"ReportsQueue/{report}", "r") as f:
+                        job = json.loads(f.read())
+                    self.cleanup(job)
+            await asyncio.sleep(30)
 
     def run(self):
         """ Start agent """
