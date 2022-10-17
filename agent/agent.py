@@ -2,22 +2,25 @@ import asyncio
 import json
 import logging
 from logging.handlers import TimedRotatingFileHandler
+from multiprocessing import Process
 import os
 from platform import system
 import requests
 from socket import gethostname
+import ssl
 import sys
-from time import sleep
+import tempfile
+import websockets
 
 
 def resourcePath(relativePath):
     """ Get absolute path to resource, works in and out of PyInstaller """
     try:
         # PyInstaller creates a temp folder and stores path in _MEIPASS
-        base_path = sys._MEIPASS
+        basePath = sys._MEIPASS
     except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
+        basePath = os.path.abspath(".")
+    return os.path.join(basePath, relativePath)
 
 
 class CommanderAgent:
@@ -27,14 +30,13 @@ class CommanderAgent:
         self.clientCert = (resourcePath("agentCert.crt"), resourcePath("agentKey.pem"))
         self.serverCert = resourcePath("commander.crt")
         self.commanderServer = serverAddress
-        self.agentID = f"{gethostname()}.{self.commanderServer}"
         self.registrationKey = registrationKey
-        if self.registrationKey:
-            self.register()
+        self.agentID = self.register()
         self.headers = {"Content-Type": "application/json",
                         "agentID": self.agentID}
         self.exitSignal = False
         self.jobQueue = asyncio.Queue()
+        self.runningJobs = []
         self.connectedToServer = False
 
     def logInit(self, logLevel):
@@ -108,8 +110,7 @@ class CommanderAgent:
                 self.log.warning("Unable to contact server")
                 self.connectedToServer = False
         except Exception as e:
-            self.log.critical(e)
-            exit(1)
+            self.log.error(f"Error while sending a request to the server: {e}")
         self.connectedToServer = True
         return response
 
@@ -121,14 +122,18 @@ class CommanderAgent:
                 configJson = json.loads(configFile.read())
                 if not configJson:
                     raise FileNotFoundError
+                return configJson["agentID"]
         except FileNotFoundError:
+            if not self.registrationKey:
             # contact server and register agent
+                self.log.critical("No registration key provided")
+                sys.exit(1)
             response = self.request("POST", "/agent/register",
                                     headers={"Content-Type": "application/json"},
                                     body={"registrationKey": self.registrationKey,
                                           "hostname": gethostname(),
                                           "os": self.os})
-            # create config and save to disk for troubleshooting
+            # create config and save to disk
             if "error" in response.json:
                 self.log.error("HTTP"+str(response.status_code)+": "+response.json["error"])
             configJson = {"hostname": gethostname(),
@@ -136,57 +141,75 @@ class CommanderAgent:
                           "commanderServer": self.commanderServer}
             with open("agentConfig.json", "w+") as configFile:
                 configFile.write(json.dumps(configJson))
-        return
+        return response.json()["agentID"]
 
     async def checkIn(self):
         """ Check in with the commander server to see if there are any jobs to run """
-        logError = True
+        # TODO: break this out into a separate class to allow for modular checkin methods
         sslContext = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        sslContext.load_verify_locations(caPath)
-        sslContext.load_cert_chain(certfile=cert[0], keyfile=cert[1])
-        async with websockets.connect(f"wss://{self.commanderServer}/agent/checkin", ssl=sslContext) as ws:
-            await ws.send(json.dumps({"Agent-ID": self.agentID}))
-            while not self.exitSignal:
-                await self.getJobs()
+        sslContext.load_verify_locations(self.caPath)
+        sslContext.load_cert_chain(certfile=self.cert[0], keyfile=self.cert[1])
+        while True:
+            try:
+                async with websockets.connect(f"wss://{self.commanderServer}/agent/checkin", ssl=sslContext) as ws:
+                    self.connectedToServer = True
+                    self.log.info("Connected to server. Listening for jobs...")
+                    await ws.send(json.dumps({"Agent-ID": self.agentID}))
+                    self.getJobs(ws)
+            except websockets.exceptions.ConnectionClosed:
+                self.connectedToServer = False
+                self.log.info("Connection to server closed. Attempting to reconnect...")
+            except Exception as e:
+                self.connectedToServer = False
+                self.log.error(f"Error connecting to websocket server: {e}")
 
-    async def getJobs(self):
+    async def getJobs(self, ws):
         """ Receive one or more jobs from the websocket """
-        try:
-            jobs = await asyncio.wait_for(ws.recv(), timeout=1)
-        except asyncio.exceptions.TimeoutError:
-            jobs = None
-        if jobs:
-            await ws.send("ack")
-            # TODO: unpack jobs and add them to thread-safe queue
+        while not self.exitSignal:
+            try:
+                jobs = await asyncio.wait_for(ws.recv(), timeout=1)
+                jobs = json.loads(jobs)
+            except asyncio.exceptions.TimeoutError:
+                jobs = None
+            if jobs:
+                await ws.send("ack")
+                self.log.info(f"Received {len(jobs)} jobs")
+                for job in jobs:
+                    self.jobQueue.put(job)
+                    self.log.debug(f"Job {job['jobID']} added to worker queue")
 
     async def worker(self):
-        """ Asynchronously check the queue for jobs """
+        """ Check the queue for jobs """
         while not self.exitSignal:
-            await self.doJob()
+            try:
+                job = await self.jobQueue.get()
+            except asyncio.exceptions.TimeoutError:
+                job = None
+            if job:
+                self.log.debug(f"Worker received job {job['jobID']} from the worker queue")
+                task = Process(target=self.doJob, args=(job,))
+                task.start()
+                self.runningJobs.append(task)
+    
+    def doJob(self, job):
+        """ Fetch the job package and start execution """
+        # TODO: break this out into a separate class to allow for modular execution types
+        response = self.request("GET", "/agent/execute",
+                                headers={"Content-Type": "application/json",
+                                         "Agent-ID": self.agentID},
+                                body={"filename": job["filename"]})
+        jobPath = f"{tempfile.gettempdir()}/{job['filename']}.job"
+        with open(jobPath, "wb") as f:
+            f.write(response.content)
+        self.execute(jobPath)
 
-    async def doJob(self):
-        """ Get a job from the queue and execute it """
-        try:
-            job = await self.jobQueue.get()
-        except asyncio.exceptions.TimeoutError:
-            job = None
-        if job:
-            # download job's executable
-            jobFile = self.fetchJobPackage(job)
-            self.execute(jobFile)
-
-    def fetchJobPackage(self, job):
-        """ Get the job package from the server and return the filename """
-        # TODO: implement
-        pass
-
-    def execute(self, filename):
-        """ Call the executable for a job and return its output and execution status """
+    def execute(self, filePath):
+        """ Execute the given job package and start cleanup """
         # TODO: implement
         pass
 
     def cleanup(self, filePath):
-        """ Remove executable for a job and send execution status back to commander server """
+        """ Delete the given job package and send execution status back to commander server """
         # TODO: implement
         pass
 
