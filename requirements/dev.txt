@@ -1,0 +1,2 @@
+-r prod.txt
+pyinstaller==5.5
