@@ -1,5 +1,4 @@
 import asyncio
-from calendar import c
 import json
 import logging
 from logging.handlers import TimedRotatingFileHandler
@@ -29,14 +28,18 @@ def resourcePath(relativePath):
 
 
 class CommanderAgent:
-    def __init__(self, serverAddress="", registrationKey="", logLevel=3):
+    def __init__(self, agentID="", appName="", serverAddress="", registrationKey="", logLevel=4):
+        self.appName = appName
         self.os = system()
         self.log = self.logInit(logLevel)
         self.clientCert = (resourcePath("agentCert.crt"), resourcePath("agentKey.pem"))
         self.serverCert = resourcePath("commander.crt")
         self.commanderServer = serverAddress
         self.registrationKey = registrationKey
-        self.agentID = self.register()
+        if self.registrationKey:
+            self.agentID = self.register()
+        else:
+            self.agentID = agentID
         self.headers = {"Content-Type": "application/json",
                         "agentID": self.agentID}
         self.exitSignal = False
@@ -120,31 +123,24 @@ class CommanderAgent:
 
     def register(self):
         """ Register agent with the commander server or fetch existing configuration """
-        # check for existing config to see if agent is already registered
-        try:
-            with open("agentConfig.json", "r") as configFile:
-                configJson = json.loads(configFile.read())
-                if not configJson:
-                    raise FileNotFoundError
-                return configJson["agentID"]
-        except FileNotFoundError:
-            if not self.registrationKey:
-            # contact server and register agent
-                self.log.critical("No registration key provided")
-                sys.exit(1)
-            response = self.request("POST", "/agent/register",
-                                    headers={"Content-Type": "application/json"},
-                                    body={"registrationKey": self.registrationKey,
-                                          "hostname": gethostname(),
-                                          "os": self.os})
-            # create config and save to disk
-            if "error" in response.json():
-                self.log.error("HTTP"+str(response.status_code)+": "+response.json()["error"])
-            configJson = {"hostname": gethostname(),
-                          "agentID": response.json()["agentID"],
-                          "commanderServer": self.commanderServer}
-            with open("agentConfig.json", "w+") as configFile:
-                configFile.write(json.dumps(configJson))
+        if not self.registrationKey:
+        # contact server and register agent
+            self.log.critical("No registration key provided")
+            sys.exit(1)
+        response = self.request("POST", "/agent/register",
+                                headers={"Content-Type": "application/json"},
+                                body={"registrationKey": self.registrationKey,
+                                        "hostname": gethostname(),
+                                        "os": self.os})
+        # create config and save to disk
+        if "error" in response.json():
+            self.log.error("HTTP"+str(response.status_code)+": "+response.json()["error"])
+        configJson = {"appName": self.appName,
+                      "agentID": response.json()["agentID"],
+                      "serverAddress": self.commanderServer,
+                      }
+        with open("agentConfig.json", "w") as configFile:
+            configFile.write(json.dumps(configJson))
         return response.json()["agentID"]
 
     async def checkIn(self):
