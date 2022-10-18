@@ -1,1 +1,1 @@
-from .agent import CommanderAgent
+from .agent import CommanderAgent, resourcePath
