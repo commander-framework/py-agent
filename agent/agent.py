@@ -138,8 +138,8 @@ class CommanderAgent:
                                           "hostname": gethostname(),
                                           "os": self.os})
             # create config and save to disk
-            if "error" in response.json:
-                self.log.error("HTTP"+str(response.status_code)+": "+response.json["error"])
+            if "error" in response.json():
+                self.log.error("HTTP"+str(response.status_code)+": "+response.json()["error"])
             configJson = {"hostname": gethostname(),
                           "agentID": response.json()["agentID"],
                           "commanderServer": self.commanderServer}
