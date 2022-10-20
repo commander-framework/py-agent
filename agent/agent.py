@@ -223,7 +223,6 @@ class CommanderAgent:
         job["stderr"] = stderr.decode("utf-8")
         self.cleanup(job)
 
-
     def cleanup(self, job):
         """ Send execution status back to commander server and delete the job package """
         response = self.request("POST", "/agent/history",
