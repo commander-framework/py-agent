@@ -4,10 +4,10 @@
 # It is intended to be run from the root of the repository.
 
 # build Linux agent
-#pyinstaller Linux-Agent.spec
+pyinstaller Linux-Agent.spec || echo "Failed to build Linux agent"
 
 # build Windows agent
-wine pyinstaller.exe Windows-Agent.spec
+wine pyinstaller.exe Windows-Agent.spec || echo "Failed to build Windows agent"
 
 # build MacOS agent
-# darling shell pyinstaller Darwin-Agent.spec
+darling shell pyinstaller Darwin-Agent.spec || echo "Failed to build MacOS agent"
